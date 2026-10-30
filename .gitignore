@@ -1,0 +1,4 @@
+# Supplied stock images and extracted copies can contain device-specific data.
+/work
+research/
+__pycache__/

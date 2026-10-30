@@ -1,0 +1,148 @@
+name: Reference xnu-8796 (iOS 16) build
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: RELEASE or DEVELOPMENT
+        default: DEVELOPMENT
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Modern runner: Apple's newer iig emits the wrong IORPC ABI for xnu-8796,
+    # so the build uses pinned iig-tools instead.
+    runs-on: xcode-27
+    timeout-minutes: 180
+    env:
+      DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+      DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+      BERGAMOTA_REPO: https://github.com/ry-diffusion/Bergamota
+      BERGAMOTA_SHA: 305b17c3fc38514949d6ecd40e9f45bc5ca49a85
+      XNU_TAG: xnu-8796.141.3
+      XNU_SHA: 1b191cb58250d0705d8a51287127505aa4bc0789
+      IIG_TOOLS_REPO: https://github.com/theo-os/iig-tools
+      IIG_TOOLS_SHA: 96c1ece6be1ceb6ee2fec6c434d080edc10da2b1
+      MACOS_VERSION: "13.5"
+      MACHINE_CONFIG: SWEET
+      KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch pinned build script and patch series
+        run: |
+          set -euo pipefail
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          test "$(git -C dxb rev-parse HEAD)" = "$DXB_SHA"
+
+          git init -q bergamota
+          git -C bergamota fetch -q --depth 1 "$BERGAMOTA_REPO" "$BERGAMOTA_SHA"
+          git -C bergamota checkout -q FETCH_HEAD
+          test "$(git -C bergamota rev-parse HEAD)" = "$BERGAMOTA_SHA"
+
+          # Three .sh files stage Apple's paired libpthread, BearSSL and HFS sources.
+          cp bergamota/xnu/patches/*.patch bergamota/xnu/patches/*.sh dxb/patches/
+          test "$(ls dxb/patches/[0-9]*.patch | wc -l | tr -d ' ')" = "133"
+
+          # libfirehose_kernel is arm64e-only; SWEET is plain arm64.
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -q 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+
+          git clone -q --depth 1 --branch "$XNU_TAG" \
+            https://github.com/apple-oss-distributions/xnu.git dxb/xnu
+          test "$(git -C dxb/xnu rev-parse HEAD)" = "$XNU_SHA"
+
+      - name: Build iig-tools for the xnu-8796 IORPC ABI
+        run: |
+          set -euo pipefail
+          git init -q iig-tools
+          git -C iig-tools fetch -q --depth 1 "$IIG_TOOLS_REPO" "$IIG_TOOLS_SHA"
+          git -C iig-tools checkout -q FETCH_HEAD
+          test "$(git -C iig-tools rev-parse HEAD)" = "$IIG_TOOLS_SHA"
+          c++ -std=c++17 -O2 -Wall -Wno-unused-function \
+            -Iiig-tools/include \
+            iig-tools/src/main.cpp iig-tools/src/parse.cpp iig-tools/src/codegen.cpp \
+            -o "$GITHUB_WORKSPACE/iig"
+          echo "IIG=$GITHUB_WORKSPACE/iig" >> "$GITHUB_ENV"
+          "$GITHUB_WORKSPACE/iig" --help
+          "$GITHUB_WORKSPACE/iig" --def dxb/xnu/iokit/DriverKit/IOService.iig \
+            --header /tmp/IOService.h --impl /tmp/IOService.iig.cpp \
+            --framework-name DriverKit
+          if grep -q kernelContent /tmp/IOService.h /tmp/IOService.iig.cpp; then
+            echo "iig-tools emitted the incompatible IORPC.kernelContent ABI"
+            exit 1
+          fi
+
+      - name: Select Xcode 27
+        run: |
+          set -euo pipefail
+          brew install jq gum bash cmake ninja ccache
+          # build.sh only checks for xcodes; the runner's Xcode is already installed.
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          XC=$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)
+          test -n "$XC" || XC=/Applications/Xcode.app
+          test -d "$XC" || { echo "no Xcode 27 image on runner"; exit 1; }
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcodebuild -version | grep -q '^Xcode 27\.' || { echo "expected Xcode 27"; exit 1; }
+          xcrun --find iig
+          sw_vers
+
+      - name: Fetch xnu-8796 KDK headers
+        run: |
+          set -euo pipefail
+          curl -L --fail --max-time 900 \
+            -o "$RUNNER_TEMP/KDK.dmg" \
+            https://github.com/dortania/KdkSupportPkg/releases/download/22G74/Kernel_Debug_Kit_13.5_build_22G74.dmg
+          hdiutil attach -nobrowse -readonly \
+            -mountpoint "$RUNNER_TEMP/kdkvol" "$RUNNER_TEMP/KDK.dmg"
+          pkg=$(find "$RUNNER_TEMP/kdkvol" -maxdepth 1 -name '*.pkg' -print -quit)
+          test -n "$pkg"
+          pkgutil --expand-full "$pkg" "$GITHUB_WORKSPACE/kdk"
+          hdiutil detach "$RUNNER_TEMP/kdkvol"
+          payload=$(find "$GITHUB_WORKSPACE/kdk" -maxdepth 3 -type d -name Payload -print -quit)
+          test -n "$payload"
+          echo "KDKROOT=$payload" >> "$GITHUB_ENV"
+          find "$payload/System/Library/KernelSupport" -maxdepth 1 -name 'lib*.a' | head
+
+      - name: Build patched kernel
+        working-directory: dxb
+        run: |
+          set +e
+          ARCH_CONFIG=ARM64 ./build.sh > "$GITHUB_WORKSPACE/build.log" 2>&1
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            tail -n 500 "$GITHUB_WORKSPACE/build.log"
+          else
+            tail -n 50 "$GITHUB_WORKSPACE/build.log"
+          fi
+          exit "$rc"
+
+      - name: Record artifact identity
+        run: |
+          set -euo pipefail
+          find dxb/fakeroot -maxdepth 1 -type f -name 'kernel*' -print
+          shasum -a 256 dxb/fakeroot/kernel* | tee kernel.sha256
+          xcodebuild -version | tee toolchain.txt
+          sw_vers >> toolchain.txt
+          git -C dxb rev-parse HEAD >> toolchain.txt
+          git -C iig-tools rev-parse HEAD >> toolchain.txt
+          "$IIG" --help >> toolchain.txt 2>&1 || true
+
+      - name: Upload kernel and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xnu-8796-reference-${{ env.KERNEL_CONFIG }}
+          if-no-files-found: warn
+          path: |
+            dxb/fakeroot/kernel*
+            kernel.sha256
+            toolchain.txt
+            build.log

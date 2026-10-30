@@ -1,0 +1,39 @@
+# Portable xnu-8796 patches taken from Bergamota ios16 305b17c.
+# These apply independently on a clean tree after the three source-staging
+# scripts run. They contain no SM7150/beryllium register addresses.
+# One patch number per line; anything after # is a comment.
+
+# Toolchain / common arm64 build
+0001  # drop clang flag removed in newer clang
+0002  # UIO_STACKBUF backport
+0005  # non-PAC build fixes
+0011  # physmap alignment padding
+
+# Kernel RNG and trust cache plumbing
+0013  # kmem RNG without corecrypto
+0014  # kernel HMAC PRNG
+0015  # trust cache runtime unavailable path
+
+# Apple open-source kernel components
+0019  # built-in pthread
+0020  # portable AES-CBC
+0022  # ramdisk root without IOMedia
+0023  # built-in SHA-256 for libkern
+0024  # mockfs virtual ramdisk I/O
+0025  # built-in AMFI without entitlements
+0027  # BearSSL MD5
+0029  # unsealed root volume
+0031  # read/write root
+0032  # BearSSL SHA-1
+0033  # BearSSL SHA-384/512
+0039  # coredump default off
+0041  # HFS link notes
+
+# Diagnostics and generic BSD/IOKit behaviour
+0042  # short exec log
+0048  # /dev/null tee
+0049  # IOKit user-client trace
+0052  # HFS rename swap
+0070  # PID hibernate
+0080  # network route/socket trace
+0106  # LaunchServices database reset on boot
